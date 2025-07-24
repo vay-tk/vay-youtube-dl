@@ -46,8 +46,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     """Start health check server in a separate thread"""
-    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
-    server.serve_forever()
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+        print(f"Health check server started on port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Health server error: {e}")
 
 def cleanup_temp_files():
     """Clean up old temporary files"""
@@ -474,6 +478,7 @@ async def download_and_send(callback_query, session):
     try:
         url = session['url']
         format_id = session['selected_quality']
+        selected_format = session['selected_format']
         
         # Use temp directory
         download_dir = DOWNLOAD_DIR
@@ -481,169 +486,72 @@ async def download_and_send(callback_query, session):
         # Clean up before download
         cleanup_temp_files()
         
-        # Handle video download
-        ydl_opts = {
-            'format': format_id,
-            'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-            'quiet': True,
-            'no_warnings': True
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-        
-        if os.path.exists(filename):
-            try:
-                await callback_query.edit_message_text("📤 Uploading file...")
-            except Exception:
-                pass
+        if selected_format == 'subtitle':
+            # Handle subtitle download
+            lang_code, sub_format = format_id.split('_')
             
-            with open(filename, 'rb') as video_file:
-                await callback_query.message.reply_video(
-                    video_file,
-                    caption=f"🎬 {info.get('title', 'Video')}\n⏱ Duration: {format_duration(info.get('duration', 0))}\n🚀 *Downloaded via Railway*"
-                )
+            ydl_opts = {
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': [lang_code],
+                'subtitlesformat': sub_format,
+                'skip_download': True,
+                'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
+                'quiet': True,
+                'no_warnings': True
+            }
             
-            os.remove(filename)
-            try:
-                await callback_query.edit_message_text("✅ Download completed!")
-            except Exception:
-                await callback_query.message.reply_text("✅ Download completed!")
-        else:
-            try:
-                await callback_query.edit_message_text("❌ Download failed!")
-            except Exception:
-                await callback_query.message.reply_text("❌ Download failed!")
-            
-    except Exception as e:
-        try:
-            await callback_query.edit_message_text(f"❌ Error: {str(e)}")
-        except Exception:
-            await callback_query.message.reply_text(f"❌ Error: {str(e)}")
-
-async def trim_and_send_video(message, session):
-    """Trim and send the video"""
-    try:
-        # Double-check FFmpeg availability
-        if not check_ffmpeg():
-            await message.reply_text(
-                "❌ **FFmpeg not found!**\n\n"
-                "Please install FFmpeg and restart the bot to use video trimming."
-            )
-            return
-        
-        url = session['url']
-        format_id = session['selected_quality']
-        start_time = session['trim_start']
-        end_time = session['trim_end']
-        
-        # Create download directory
-        download_dir = DOWNLOAD_DIR
-        
-        # Download the video
-        status_msg = await message.reply_text("📥 Downloading video...")
-        
-        ydl_opts = {
-            'format': format_id,
-            'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-            'quiet': True
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            input_filename = ydl.prepare_filename(info)
-        
-        if not os.path.exists(input_filename):
-            await status_msg.edit_text("❌ Failed to download video!")
-            return
-        
-        # Update status
-        await status_msg.edit_text("✂️ Trimming video...")
-        
-        # Trim the video using ffmpeg
-        output_filename = input_filename.replace('.', '_trimmed.')
-        
-        cmd = [
-            'ffmpeg', '-i', input_filename,
-            '-ss', start_time, '-to', end_time,
-            '-c', 'copy', output_filename, '-y'
-        ]
-        
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                error_msg = stderr.decode('utf-8') if stderr else "Unknown FFmpeg error"
-                await status_msg.edit_text(f"❌ FFmpeg error: {error_msg[:200]}...")
-                # Clean up
-                if os.path.exists(input_filename):
-                    os.remove(input_filename)
-                return
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
                 
-        except Exception as e:
-            await status_msg.edit_text(f"❌ FFmpeg execution error: {str(e)}")
-            # Clean up
-            if os.path.exists(input_filename):
-                os.remove(input_filename)
-            return
-        
-        if os.path.exists(output_filename):
-            # Update status
-            await status_msg.edit_text("📤 Uploading trimmed video...")
+            # Find subtitle file
+            subtitle_file = None
+            for file in os.listdir(download_dir):
+                if file.endswith(f'.{lang_code}.{sub_format}'):
+                    subtitle_file = os.path.join(download_dir, file)
+                    break
             
-            # Send the trimmed file
-            try:
-                with open(output_filename, 'rb') as video_file:
-                    await message.reply_video(
-                        video_file,
-                        caption=f"✂️ Trimmed: {info.get('title', 'Video')}\n"
-                               f"⏱ From: {start_time} To: {end_time}"
+            if subtitle_file and os.path.exists(subtitle_file):
+                try:
+                    await callback_query.edit_message_text("📤 Uploading subtitle file...")
+                except Exception:
+                    pass
+                
+                with open(subtitle_file, 'rb') as sub_file:
+                    await callback_query.message.reply_document(
+                        sub_file,
+                        caption=f"📝 Subtitle: {info.get('title', 'Video')}\n🌐 Language: {lang_code.upper()}\n🚀 *Downloaded via Railway*"
                     )
                 
-                await status_msg.edit_text("✅ Trimmed video sent!")
-                
-            except Exception as e:
-                await status_msg.edit_text(f"❌ Upload error: {str(e)}")
+                os.remove(subtitle_file)
+                try:
+                    await callback_query.edit_message_text("✅ Subtitle download completed!")
+                except Exception:
+                    await callback_query.message.reply_text("✅ Subtitle download completed!")
+            else:
+                try:
+                    await callback_query.edit_message_text("❌ Subtitle download failed!")
+                except Exception:
+                    await callback_query.message.reply_text("❌ Subtitle download failed!")
+        
+        elif selected_format == 'audio':
+            # Handle audio download
+            ydl_opts = {
+                'format': format_id,
+                'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
+                'quiet': True,
+                'no_warnings': True
+            }
             
-            # Clean up
-            try:
-                if os.path.exists(input_filename):
-                    os.remove(input_filename)
-                if os.path.exists(output_filename):
-                    os.remove(output_filename)
-            except Exception:
-                pass
-        else:
-            await status_msg.edit_text("❌ Trimming failed - output file not created!")
-            # Clean up
-            if os.path.exists(input_filename):
-                os.remove(input_filename)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
             
-    except Exception as e:
-        await message.reply_text(f"❌ Trimming error: {str(e)}")
-
-if __name__ == "__main__":
-    print("🚀 YouTube Downloader Bot starting on Railway...")
-    print(f"📁 Using temp directory: {DOWNLOAD_DIR}")
-    print(f"🔧 FFmpeg available: {check_ffmpeg()}")
-    print(f"🌐 Health server starting on port {PORT}")
-    
-    # Start health check server in background
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-    
-    # Clean up on startup
-    cleanup_temp_files()
-    
-    # Start the bot
-    app.run()
+            if os.path.exists(filename):
+                try:
+                    await callback_query.edit_message_text("📤 Uploading audio file...")
+                except Exception:
+                    pass
                 
                 with open(filename, 'rb') as audio_file:
                     await callback_query.message.reply_audio(
@@ -798,8 +706,7 @@ async def trim_and_send_video(message, session):
         end_time = session['trim_end']
         
         # Create download directory
-        download_dir = "downloads"
-        os.makedirs(download_dir, exist_ok=True)
+        download_dir = DOWNLOAD_DIR
         
         # Download the video
         status_msg = await message.reply_text("📥 Downloading video...")
@@ -891,10 +798,20 @@ async def trim_and_send_video(message, session):
 
 if __name__ == "__main__":
     print("🚀 YouTube Downloader Bot starting on Railway...")
-    print(f"📁 Using temp directory: {DOWNLOAD_DIR}")
+    print(f"📁 Using temp directory: {DOWNLOAD_DIR}")  
     print(f"🔧 FFmpeg available: {check_ffmpeg()}")
+    print(f"🌐 Health server will start on port {PORT}")
+    
+    # Start health check server in background thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
+    # Give health server a moment to start
+    time.sleep(2)
     
     # Clean up on startup
     cleanup_temp_files()
     
+    print("✅ Starting Telegram bot...")
+    # Start the bot
     app.run()
