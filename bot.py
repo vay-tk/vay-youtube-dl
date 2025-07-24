@@ -7,17 +7,36 @@ import yt_dlp
 from dotenv import load_dotenv
 import subprocess
 import json
+import tempfile
+import shutil
 
 load_dotenv()
 
-API_ID = os.getenv("API_ID")
+API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 8000))
 
 app = Client("youtube_dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # Storage for user sessions
 user_sessions = {}
+
+# Use temp directory for Railway
+DOWNLOAD_DIR = tempfile.mkdtemp()
+
+def cleanup_temp_files():
+    """Clean up old temporary files"""
+    try:
+        if os.path.exists(DOWNLOAD_DIR):
+            for file in os.listdir(DOWNLOAD_DIR):
+                file_path = os.path.join(DOWNLOAD_DIR, file)
+                if os.path.isfile(file_path):
+                    # Remove files older than 1 hour
+                    if os.path.getmtime(file_path) < (asyncio.get_event_loop().time() - 3600):
+                        os.remove(file_path)
+    except Exception:
+        pass
 
 def get_video_info(url):
     """Extract video information using yt-dlp"""
@@ -275,18 +294,22 @@ async def split_video(input_file, output_dir, chunk_size_mb=50):
         return []
 
 def check_ffmpeg():
-    """Check if FFmpeg is available"""
+    """Check if FFmpeg is available - should work on Railway with nixpacks.toml"""
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, timeout=10)
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
+    # Clean up temp files on start
+    cleanup_temp_files()
+    
     await message.reply_text(
         "🎬 **YouTube Downloader Bot**\n\n"
-        "Send me a YouTube URL to get started!",
+        "Send me a YouTube URL to get started!\n\n"
+        "🚀 *Running on Railway Cloud*",
         reply_markup=None
     )
 
@@ -543,15 +566,17 @@ async def handle_callback(client, callback_query: CallbackQuery):
             pass
 
 async def download_and_send(callback_query, session):
-    """Download and send the video file"""
+    """Download and send the video file - Railway optimized"""
     try:
         url = session['url']
         format_id = session['selected_quality']
         selected_format = session['selected_format']
         
-        # Create download directory
-        download_dir = "downloads"
-        os.makedirs(download_dir, exist_ok=True)
+        # Use temp directory
+        download_dir = DOWNLOAD_DIR
+        
+        # Clean up before download
+        cleanup_temp_files()
         
         if selected_format == 'subtitle':
             # Handle subtitle download
@@ -564,7 +589,8 @@ async def download_and_send(callback_query, session):
                 'subtitlesformat': sub_format,
                 'skip_download': True,
                 'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-                'quiet': True
+                'quiet': True,
+                'no_warnings': True
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -586,7 +612,7 @@ async def download_and_send(callback_query, session):
                 with open(subtitle_file, 'rb') as sub_file:
                     await callback_query.message.reply_document(
                         sub_file,
-                        caption=f"📝 Subtitle: {info.get('title', 'Video')}\n🌐 Language: {lang_code.upper()}"
+                        caption=f"📝 Subtitle: {info.get('title', 'Video')}\n🌐 Language: {lang_code.upper()}\n🚀 *Downloaded via Railway*"
                     )
                 
                 os.remove(subtitle_file)
@@ -605,7 +631,8 @@ async def download_and_send(callback_query, session):
             ydl_opts = {
                 'format': format_id,
                 'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-                'quiet': True
+                'quiet': True,
+                'no_warnings': True
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -621,7 +648,7 @@ async def download_and_send(callback_query, session):
                 with open(filename, 'rb') as audio_file:
                     await callback_query.message.reply_audio(
                         audio_file,
-                        caption=f"🎵 {info.get('title', 'Audio')}\n⏱ Duration: {format_duration(info.get('duration', 0))}",
+                        caption=f"🎵 {info.get('title', 'Audio')}\n⏱ Duration: {format_duration(info.get('duration', 0))}\n🚀 *Downloaded via Railway*",
                         title=info.get('title', 'Audio'),
                         performer=info.get('uploader', 'Unknown')
                     )
@@ -642,7 +669,8 @@ async def download_and_send(callback_query, session):
             ydl_opts = {
                 'format': format_id,
                 'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-                'quiet': True
+                'quiet': True,
+                'no_warnings': True
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -659,12 +687,12 @@ async def download_and_send(callback_query, session):
                     if selected_format == 'animation':
                         await callback_query.message.reply_animation(
                             file,
-                            caption=f"🎭 {info.get('title', 'Animation')}\n⏱ Duration: {format_duration(info.get('duration', 0))}"
+                            caption=f"🎭 {info.get('title', 'Animation')}\n⏱ Duration: {format_duration(info.get('duration', 0))}\n🚀 *Downloaded via Railway*"
                         )
                     else:  # document
                         await callback_query.message.reply_document(
                             file,
-                            caption=f"📄 {info.get('title', 'Document')}\n⏱ Duration: {format_duration(info.get('duration', 0))}"
+                            caption=f"📄 {info.get('title', 'Document')}\n⏱ Duration: {format_duration(info.get('duration', 0))}\n🚀 *Downloaded via Railway*"
                         )
                 
                 os.remove(filename)
@@ -679,11 +707,12 @@ async def download_and_send(callback_query, session):
                     await callback_query.message.reply_text("❌ Download failed!")
         
         else:
-            # Handle video download (existing code)
+            # Handle video download
             ydl_opts = {
                 'format': format_id,
                 'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-                'quiet': True
+                'quiet': True,
+                'no_warnings': True
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -699,7 +728,7 @@ async def download_and_send(callback_query, session):
                 with open(filename, 'rb') as video_file:
                     await callback_query.message.reply_video(
                         video_file,
-                        caption=f"🎬 {info.get('title', 'Video')}\n⏱ Duration: {format_duration(info.get('duration', 0))}"
+                        caption=f"🎬 {info.get('title', 'Video')}\n⏱ Duration: {format_duration(info.get('duration', 0))}\n🚀 *Downloaded via Railway*"
                     )
                 
                 os.remove(filename)
@@ -861,5 +890,11 @@ async def trim_and_send_video(message, session):
         await message.reply_text(f"❌ Trimming error: {str(e)}")
 
 if __name__ == "__main__":
-    print("🚀 Bot starting...")
+    print("🚀 YouTube Downloader Bot starting on Railway...")
+    print(f"📁 Using temp directory: {DOWNLOAD_DIR}")
+    print(f"🔧 FFmpeg available: {check_ffmpeg()}")
+    
+    # Clean up on startup
+    cleanup_temp_files()
+    
     app.run()

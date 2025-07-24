@@ -3,3 +3,4 @@ python-dotenv==1.0.0
 TgCrypto==1.2.5
 yt-dlp
 ffmpeg-python
+aiofiles==23.2.1
