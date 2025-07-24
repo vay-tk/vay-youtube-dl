@@ -9,6 +9,9 @@ import subprocess
 import json
 import tempfile
 import shutil
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 load_dotenv()
 
@@ -25,6 +28,27 @@ user_sessions = {}
 # Use temp directory for Railway
 DOWNLOAD_DIR = tempfile.mkdtemp()
 
+# Health check server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status": "healthy", "bot": "running"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress default logging
+        pass
+
+def start_health_server():
+    """Start health check server in a separate thread"""
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    server.serve_forever()
+
 def cleanup_temp_files():
     """Clean up old temporary files"""
     try:
@@ -33,7 +57,7 @@ def cleanup_temp_files():
                 file_path = os.path.join(DOWNLOAD_DIR, file)
                 if os.path.isfile(file_path):
                     # Remove files older than 1 hour
-                    if os.path.getmtime(file_path) < (asyncio.get_event_loop().time() - 3600):
+                    if os.path.getmtime(file_path) < (time.time() - 3600):
                         os.remove(file_path)
     except Exception:
         pass
@@ -164,137 +188,17 @@ def get_animation_quality_keyboard(formats):
     keyboard.append([InlineKeyboardButton("🔙 Go Back", callback_data="go_back")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_download_options_keyboard(selected_format=None, filesize=0):
+def get_download_options_keyboard():
     """Create download options keyboard after format selection"""
-    keyboard = []
-    
-    # Check file size and add appropriate options
-    if filesize > 2000 * 1024 * 1024:  # > 2GB
-        keyboard.append([InlineKeyboardButton("🗜️ Compress & Download", callback_data="compress_download")])
-        keyboard.append([InlineKeyboardButton("✂️ Split into Parts", callback_data="split_download")])
-        if selected_format == 'video':
-            keyboard.append([InlineKeyboardButton("🎵 Audio Only", callback_data="audio_only")])
-            keyboard.append([InlineKeyboardButton("📱 Lower Quality", callback_data="lower_quality")])
-    elif filesize > 50 * 1024 * 1024:  # > 50MB
-        keyboard.append([InlineKeyboardButton("✅ Get TG File", callback_data="download_file")])
-        keyboard.append([InlineKeyboardButton("🗜️ Compress & Download", callback_data="compress_download")])
-        if selected_format == 'video':
-            keyboard.append([InlineKeyboardButton("✂️ trim video 🎮", callback_data="trim_video")])
-    else:
-        keyboard.append([InlineKeyboardButton("✅ Get TG File", callback_data="download_file")])
-        if selected_format == 'video':
-            keyboard.append([InlineKeyboardButton("✂️ trim video 🎮", callback_data="trim_video")])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Go Back", callback_data="select_quality")])
+    keyboard = [
+        [InlineKeyboardButton("✅ Get TG File", callback_data="download_file")],
+        [InlineKeyboardButton("✂️ trim video 🎮", callback_data="trim_video")],
+        [InlineKeyboardButton("🔙 Go Back", callback_data="select_quality")]
+    ]
     return InlineKeyboardMarkup(keyboard)
 
-def format_file_size(bytes_size):
-    """Convert bytes to human readable format"""
-    if bytes_size < 1024:
-        return f"{bytes_size} B"
-    elif bytes_size < 1024**2:
-        return f"{bytes_size/1024:.1f} KB"
-    elif bytes_size < 1024**3:
-        return f"{bytes_size/(1024**2):.1f} MB"
-    else:
-        return f"{bytes_size/(1024**3):.2f} GB"
-
-async def compress_video(input_file, output_file, target_size_mb=50):
-    """Compress video to target size using FFmpeg"""
-    if not check_ffmpeg():
-        return False
-    
-    try:
-        # Get video duration first
-        probe_cmd = [
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_format', '-show_streams', input_file
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *probe_cmd, stdout=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await process.communicate()
-        
-        info = json.loads(stdout.decode())
-        duration = float(info['format']['duration'])
-        
-        # Calculate target bitrate
-        target_bitrate = int((target_size_mb * 8 * 1024) / duration * 0.9)  # 90% for safety
-        
-        # Compress video
-        cmd = [
-            'ffmpeg', '-i', input_file,
-            '-c:v', 'libx265', '-preset', 'medium',
-            '-b:v', f'{target_bitrate}k',
-            '-c:a', 'aac', '-b:a', '64k',
-            '-movflags', '+faststart',
-            output_file, '-y'
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        
-        await process.communicate()
-        return process.returncode == 0
-        
-    except Exception:
-        return False
-
-async def split_video(input_file, output_dir, chunk_size_mb=50):
-    """Split video into smaller chunks"""
-    if not check_ffmpeg():
-        return []
-    
-    try:
-        # Get video duration
-        probe_cmd = [
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_format', input_file
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *probe_cmd, stdout=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await process.communicate()
-        
-        info = json.loads(stdout.decode())
-        duration = float(info['format']['duration'])
-        file_size = int(info['format']['size'])
-        
-        # Calculate chunk duration
-        chunk_duration = (chunk_size_mb * 1024 * 1024 * duration) / file_size
-        chunk_count = int(duration / chunk_duration) + 1
-        
-        output_files = []
-        
-        for i in range(chunk_count):
-            start_time = i * chunk_duration
-            output_file = os.path.join(output_dir, f"part_{i+1:02d}.mp4")
-            
-            cmd = [
-                'ffmpeg', '-i', input_file,
-                '-ss', str(start_time), '-t', str(chunk_duration),
-                '-c', 'copy', output_file, '-y'
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            
-            await process.communicate()
-            
-            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                output_files.append(output_file)
-        
-        return output_files
-        
-    except Exception:
-        return []
-
 def check_ffmpeg():
-    """Check if FFmpeg is available - should work on Railway with nixpacks.toml"""
+    """Check if FFmpeg is available - should work on Railway with Dockerfile"""
     try:
         result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, timeout=10)
         return True
@@ -485,7 +389,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
                 height = selected_fmt.get('height', 'unknown')
                 ext = selected_fmt.get('ext', 'unknown').upper()
                 filesize = selected_fmt.get('filesize') or selected_fmt.get('filesize_approx', 0)
-                filesize_str = format_file_size(filesize) if filesize else "unknown size"
+                filesize_str = f"{filesize / (1024*1024):.2f} MiB" if filesize else "unknown size"
                 vcodec = selected_fmt.get('vcodec', 'unknown')
                 fps = selected_fmt.get('fps', 30)
                 duration = session['video_info'].get('duration', 0)
@@ -503,7 +407,7 @@ async def handle_callback(client, callback_query: CallbackQuery):
                     f"**Selected Format:** {format_text}\n"
                     f"**Upload Type:** {session['selected_format'].title()}\n"
                     f"**YouTube Duration:** {format_duration(duration)}\n{warning_text}",
-                    reply_markup=get_download_options_keyboard(session['selected_format'], filesize)
+                    reply_markup=get_download_options_keyboard()
                 )
         
         elif data.startswith("subtitle_"):
@@ -566,11 +470,10 @@ async def handle_callback(client, callback_query: CallbackQuery):
             pass
 
 async def download_and_send(callback_query, session):
-    """Download and send the video file - Railway optimized"""
+    """Download and send the video file"""
     try:
         url = session['url']
         format_id = session['selected_quality']
-        selected_format = session['selected_format']
         
         # Use temp directory
         download_dir = DOWNLOAD_DIR
@@ -578,72 +481,169 @@ async def download_and_send(callback_query, session):
         # Clean up before download
         cleanup_temp_files()
         
-        if selected_format == 'subtitle':
-            # Handle subtitle download
-            lang_code, sub_format = format_id.split('_')
+        # Handle video download
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+        
+        if os.path.exists(filename):
+            try:
+                await callback_query.edit_message_text("📤 Uploading file...")
+            except Exception:
+                pass
             
-            ydl_opts = {
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': [lang_code],
-                'subtitlesformat': sub_format,
-                'skip_download': True,
-                'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-                'quiet': True,
-                'no_warnings': True
-            }
+            with open(filename, 'rb') as video_file:
+                await callback_query.message.reply_video(
+                    video_file,
+                    caption=f"🎬 {info.get('title', 'Video')}\n⏱ Duration: {format_duration(info.get('duration', 0))}\n🚀 *Downloaded via Railway*"
+                )
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            os.remove(filename)
+            try:
+                await callback_query.edit_message_text("✅ Download completed!")
+            except Exception:
+                await callback_query.message.reply_text("✅ Download completed!")
+        else:
+            try:
+                await callback_query.edit_message_text("❌ Download failed!")
+            except Exception:
+                await callback_query.message.reply_text("❌ Download failed!")
+            
+    except Exception as e:
+        try:
+            await callback_query.edit_message_text(f"❌ Error: {str(e)}")
+        except Exception:
+            await callback_query.message.reply_text(f"❌ Error: {str(e)}")
+
+async def trim_and_send_video(message, session):
+    """Trim and send the video"""
+    try:
+        # Double-check FFmpeg availability
+        if not check_ffmpeg():
+            await message.reply_text(
+                "❌ **FFmpeg not found!**\n\n"
+                "Please install FFmpeg and restart the bot to use video trimming."
+            )
+            return
+        
+        url = session['url']
+        format_id = session['selected_quality']
+        start_time = session['trim_start']
+        end_time = session['trim_end']
+        
+        # Create download directory
+        download_dir = DOWNLOAD_DIR
+        
+        # Download the video
+        status_msg = await message.reply_text("📥 Downloading video...")
+        
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
+            'quiet': True
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            input_filename = ydl.prepare_filename(info)
+        
+        if not os.path.exists(input_filename):
+            await status_msg.edit_text("❌ Failed to download video!")
+            return
+        
+        # Update status
+        await status_msg.edit_text("✂️ Trimming video...")
+        
+        # Trim the video using ffmpeg
+        output_filename = input_filename.replace('.', '_trimmed.')
+        
+        cmd = [
+            'ffmpeg', '-i', input_filename,
+            '-ss', start_time, '-to', end_time,
+            '-c', 'copy', output_filename, '-y'
+        ]
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode('utf-8') if stderr else "Unknown FFmpeg error"
+                await status_msg.edit_text(f"❌ FFmpeg error: {error_msg[:200]}...")
+                # Clean up
+                if os.path.exists(input_filename):
+                    os.remove(input_filename)
+                return
                 
-            # Find subtitle file
-            subtitle_file = None
-            for file in os.listdir(download_dir):
-                if file.endswith(f'.{lang_code}.{sub_format}'):
-                    subtitle_file = os.path.join(download_dir, file)
-                    break
+        except Exception as e:
+            await status_msg.edit_text(f"❌ FFmpeg execution error: {str(e)}")
+            # Clean up
+            if os.path.exists(input_filename):
+                os.remove(input_filename)
+            return
+        
+        if os.path.exists(output_filename):
+            # Update status
+            await status_msg.edit_text("📤 Uploading trimmed video...")
             
-            if subtitle_file and os.path.exists(subtitle_file):
-                try:
-                    await callback_query.edit_message_text("📤 Uploading subtitle file...")
-                except Exception:
-                    pass
-                
-                with open(subtitle_file, 'rb') as sub_file:
-                    await callback_query.message.reply_document(
-                        sub_file,
-                        caption=f"📝 Subtitle: {info.get('title', 'Video')}\n🌐 Language: {lang_code.upper()}\n🚀 *Downloaded via Railway*"
+            # Send the trimmed file
+            try:
+                with open(output_filename, 'rb') as video_file:
+                    await message.reply_video(
+                        video_file,
+                        caption=f"✂️ Trimmed: {info.get('title', 'Video')}\n"
+                               f"⏱ From: {start_time} To: {end_time}"
                     )
                 
-                os.remove(subtitle_file)
-                try:
-                    await callback_query.edit_message_text("✅ Subtitle download completed!")
-                except Exception:
-                    await callback_query.message.reply_text("✅ Subtitle download completed!")
-            else:
-                try:
-                    await callback_query.edit_message_text("❌ Subtitle download failed!")
-                except Exception:
-                    await callback_query.message.reply_text("❌ Subtitle download failed!")
-        
-        elif selected_format == 'audio':
-            # Handle audio download
-            ydl_opts = {
-                'format': format_id,
-                'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-                'quiet': True,
-                'no_warnings': True
-            }
+                await status_msg.edit_text("✅ Trimmed video sent!")
+                
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Upload error: {str(e)}")
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
+            # Clean up
+            try:
+                if os.path.exists(input_filename):
+                    os.remove(input_filename)
+                if os.path.exists(output_filename):
+                    os.remove(output_filename)
+            except Exception:
+                pass
+        else:
+            await status_msg.edit_text("❌ Trimming failed - output file not created!")
+            # Clean up
+            if os.path.exists(input_filename):
+                os.remove(input_filename)
             
-            if os.path.exists(filename):
-                try:
-                    await callback_query.edit_message_text("📤 Uploading audio file...")
-                except Exception:
-                    pass
+    except Exception as e:
+        await message.reply_text(f"❌ Trimming error: {str(e)}")
+
+if __name__ == "__main__":
+    print("🚀 YouTube Downloader Bot starting on Railway...")
+    print(f"📁 Using temp directory: {DOWNLOAD_DIR}")
+    print(f"🔧 FFmpeg available: {check_ffmpeg()}")
+    print(f"🌐 Health server starting on port {PORT}")
+    
+    # Start health check server in background
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
+    # Clean up on startup
+    cleanup_temp_files()
+    
+    # Start the bot
+    app.run()
                 
                 with open(filename, 'rb') as audio_file:
                     await callback_query.message.reply_audio(
