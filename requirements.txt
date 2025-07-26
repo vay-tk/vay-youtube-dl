@@ -4,3 +4,4 @@ TgCrypto==1.2.5
 yt-dlp>=2023.12.30
 aiofiles==23.2.1
 uvicorn==0.24.0
+ffmpeg-python
