@@ -1,12 +1,15 @@
 import os
 import asyncio
 import math
+import random
+import time
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 import yt_dlp
 from dotenv import load_dotenv
 import tempfile
 import shutil
+import json
 
 load_dotenv()
 
@@ -20,19 +23,140 @@ app = Client(
 # Store user selections temporarily
 user_data = {}
 
-def get_video_info(url):
-    """Extract video information using yt-dlp"""
-    ydl_opts = {
+# Professional user agents for rotation
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0'
+]
+
+def get_cookies_path():
+    """Get path to cookies file"""
+    cookies_dir = os.path.join(os.path.dirname(__file__), 'cookies')
+    os.makedirs(cookies_dir, exist_ok=True)
+    return os.path.join(cookies_dir, 'youtube_cookies.txt')
+
+def create_robust_ydl_opts(additional_opts=None):
+    """Create robust yt-dlp options with anti-bot measures"""
+    base_opts = {
         'quiet': True,
         'no_warnings': True,
+        'user_agent': random.choice(USER_AGENTS),
+        'sleep_interval': random.uniform(1, 3),
+        'max_sleep_interval': 5,
+        'extractor_retries': 3,
+        'fragment_retries': 3,
+        'skip_unavailable_fragments': True,
+        'ignoreerrors': False,
+        'no_check_certificate': True,
+        'prefer_insecure': False,
+        'http_headers': {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
     }
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    # Add cookies if available
+    cookies_path = get_cookies_path()
+    if os.path.exists(cookies_path):
+        base_opts['cookiefile'] = cookies_path
+    
+    # Try to extract cookies from browser as fallback
+    for browser in ['chrome', 'firefox', 'safari', 'edge']:
         try:
+            base_opts['cookiesfrombrowser'] = (browser,)
+            break
+        except:
+            continue
+    
+    if additional_opts:
+        base_opts.update(additional_opts)
+    
+    return base_opts
+
+def get_video_info(url, retry_count=0):
+    """Extract video information with robust error handling"""
+    max_retries = 3
+    
+    if retry_count >= max_retries:
+        return None
+    
+    try:
+        # Add random delay between retries
+        if retry_count > 0:
+            time.sleep(random.uniform(2, 5))
+        
+        ydl_opts = create_robust_ydl_opts()
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return info
+            
+    except yt_dlp.utils.ExtractorError as e:
+        error_msg = str(e).lower()
+        
+        if 'sign in to confirm' in error_msg or 'bot' in error_msg:
+            # Handle bot detection specifically
+            if retry_count < max_retries - 1:
+                return get_video_info_with_fallback(url, retry_count + 1)
+        
+        return None
+    except Exception as e:
+        if retry_count < max_retries - 1:
+            return get_video_info(url, retry_count + 1)
+        return None
+
+def get_video_info_with_fallback(url, retry_count=0):
+    """Fallback method with different strategies"""
+    strategies = [
+        # Strategy 1: Use different user agent and headers
+        {
+            'user_agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+            'http_headers': {
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept': '*/*',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+            }
+        },
+        # Strategy 2: Mobile user agent
+        {
+            'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+            'http_headers': {
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            }
+        },
+        # Strategy 3: Embed extraction
+        {
+            'user_agent': random.choice(USER_AGENTS),
+            'extract_flat': False,
+            'force_json': True,
+        }
+    ]
+    
+    for i, strategy in enumerate(strategies):
+        if retry_count > i:
+            continue
+            
+        try:
+            time.sleep(random.uniform(3, 6))  # Longer delay
+            ydl_opts = create_robust_ydl_opts(strategy)
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return info
+                
         except Exception as e:
-            return None
+            continue
+    
+    return None
 
 def format_duration(seconds):
     """Format duration in human readable format"""
@@ -123,9 +247,36 @@ async def handle_url(client, message):
     
     progress_msg = await message.reply_text("🔍 Analyzing video...")
     
-    video_info = get_video_info(url)
+    # Try multiple times with different strategies
+    video_info = None
+    for attempt in range(3):
+        if attempt > 0:
+            await progress_msg.edit_text(f"🔍 Analyzing video... (Attempt {attempt + 1}/3)")
+        
+        video_info = get_video_info(url, attempt)
+        if video_info:
+            break
+        
+        # Wait before next attempt
+        await asyncio.sleep(2)
+    
     if not video_info:
-        await progress_msg.edit_text("❌ Failed to get video information. Please check the URL!")
+        error_text = """
+❌ **Failed to get video information**
+
+This might be due to:
+• Video is private or restricted
+• YouTube bot detection
+• Video is not available in your region
+
+**Solutions:**
+1. Try again in a few minutes
+2. Make sure the video is public
+3. Contact admin if issue persists
+
+💡 **Tip:** The bot automatically tries multiple methods to bypass restrictions.
+"""
+        await progress_msg.edit_text(error_text)
         return
     
     # Store video info for user
@@ -327,11 +478,10 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         # Clean filename from invalid characters
         safe_title = "".join(c for c in original_title if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
         
-        # Configure yt-dlp options based on media type
-        ydl_opts = {
+        # Configure yt-dlp options with anti-bot measures
+        ydl_opts = create_robust_ydl_opts({
             'outtmpl': f'{temp_dir}/{safe_title}.%(ext)s',
-            'quiet': True,
-        }
+        })
         
         if media_type == "audio":
             ydl_opts.update({
@@ -348,9 +498,31 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         elif media_type == "document":
             ydl_opts['format'] = 'best'
         
-        # Download the file
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        # Download with retry mechanism
+        max_download_retries = 2
+        download_success = False
+        
+        for attempt in range(max_download_retries):
+            try:
+                if attempt > 0:
+                    await callback_query.edit_message_text(f"📥 Download attempt {attempt + 1}/{max_download_retries}...")
+                    # Rotate user agent for retry
+                    ydl_opts['user_agent'] = random.choice(USER_AGENTS)
+                    time.sleep(random.uniform(3, 6))
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                    download_success = True
+                    break
+                    
+            except Exception as e:
+                if attempt == max_download_retries - 1:
+                    raise e
+                continue
+        
+        if not download_success:
+            await callback_query.edit_message_text("❌ Download failed after multiple attempts!")
+            return
         
         # Find downloaded file
         downloaded_files = []
@@ -420,7 +592,15 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         await callback_query.edit_message_text("✅ Upload completed successfully!")
         
     except Exception as e:
-        await callback_query.edit_message_text(f"❌ Error during download: {str(e)}")
+        error_msg = str(e)
+        if 'sign in to confirm' in error_msg.lower() or 'bot' in error_msg.lower():
+            await callback_query.edit_message_text(
+                "❌ **YouTube Bot Detection**\n\n"
+                "YouTube has detected automated access. This is temporary.\n"
+                "Please try again in a few minutes or contact admin for cookies setup."
+            )
+        else:
+            await callback_query.edit_message_text(f"❌ Error during download: {str(e)}")
     
     finally:
         # Clean up temporary files
