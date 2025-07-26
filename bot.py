@@ -1,55 +1,41 @@
 import os
-import re
 import asyncio
+import math
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 import yt_dlp
 from dotenv import load_dotenv
-import subprocess
-import json
-from aiohttp import web
-import threading
+import tempfile
+import shutil
 
 load_dotenv()
 
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+app = Client(
+    "youtube_dl_bot",
+    api_id=int(os.getenv("API_ID")),
+    api_hash=os.getenv("API_HASH"),
+    bot_token=os.getenv("BOT_TOKEN")
+)
 
-app = Client("youtube_dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# Storage for user sessions
-user_sessions = {}
-
-# Health check web server
-async def health_check(request):
-    return web.Response(text="OK", status=200)
-
-async def start_web_server():
-    """Start a simple web server for health checks"""
-    web_app = web.Application()
-    web_app.router.add_get('/health', health_check)
-    web_app.router.add_get('/', health_check)
-    
-    port = int(os.environ.get('PORT', 8000))
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Web server started on port {port}")
+# Store user selections temporarily
+user_data = {}
 
 def get_video_info(url):
     """Extract video information using yt-dlp"""
-    try:
-        ydl_opts = {'quiet': True, 'no_warnings': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
             info = ydl.extract_info(url, download=False)
             return info
-    except Exception as e:
-        return None
+        except Exception as e:
+            return None
 
 def format_duration(seconds):
-    """Convert seconds to readable format"""
+    """Format duration in human readable format"""
     if seconds < 60:
         return f"{seconds}s"
     elif seconds < 3600:
@@ -59,351 +45,389 @@ def format_duration(seconds):
     else:
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
-        return f"{hours}h {minutes}m"
+        return f"{hours} hours {minutes} minutes"
 
-def get_format_keyboard():
-    """Create format selection keyboard"""
-    keyboard = [
-        [InlineKeyboardButton("🎵 Audio", callback_data="format_audio")],
-        [InlineKeyboardButton("ℹ️ Info", callback_data="format_info")],
-        [InlineKeyboardButton("📝 Subtitle", callback_data="format_subtitle")],
-        [InlineKeyboardButton("🎭 Animation", callback_data="format_animation")],
-        [InlineKeyboardButton("📄 Document", callback_data="format_document")],
-        [InlineKeyboardButton("🎥 Video", callback_data="format_video")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+def format_filesize(bytes_size):
+    """Format file size in human readable format"""
+    if bytes_size == 0:
+        return "0 B"
+    size_names = ["B", "KiB", "MiB", "GiB"]
+    i = int(math.floor(math.log(bytes_size, 1024)))
+    p = math.pow(1024, i)
+    s = round(bytes_size / p, 2)
+    return f"{s} {size_names[i]}"
 
-def get_video_quality_keyboard(formats):
-    """Create video quality selection keyboard"""
-    keyboard = []
+async def split_video(file_path, max_size=1024*1024*1024):  # 1GB
+    """Split video file if larger than max_size"""
+    file_size = os.path.getsize(file_path)
+    if file_size <= max_size:
+        return [file_path]
     
-    # Add storyboard formats (if any)
-    storyboard_formats = [f for f in formats if f.get('format_note') == 'storyboard']
-    for fmt in storyboard_formats[:3]:  # Limit to 3 storyboard formats
-        keyboard.append([InlineKeyboardButton(
-            f"storyboard [ MHTML ] [ none {fmt.get('fps', 'unknown')} ]",
-            callback_data=f"quality_{fmt['format_id']}"
-        )])
+    # Calculate number of parts needed
+    parts = math.ceil(file_size / max_size)
+    part_files = []
     
-    # Add video formats
-    video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('height')]
-    seen_qualities = set()
+    # Use ffmpeg to split video
+    base_name = os.path.splitext(file_path)[0]
+    extension = os.path.splitext(file_path)[1]
     
-    for fmt in sorted(video_formats, key=lambda x: x.get('height', 0)):
-        height = fmt.get('height')
-        if not height or height in seen_qualities:
-            continue
-        seen_qualities.add(height)
+    # Get video duration
+    import subprocess
+    result = subprocess.run([
+        'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1', file_path
+    ], capture_output=True, text=True)
+    
+    total_duration = float(result.stdout.strip())
+    part_duration = total_duration / parts
+    
+    for i in range(parts):
+        start_time = i * part_duration
+        part_file = f"{base_name}_part{i+1}{extension}"
         
-        ext = fmt.get('ext', 'unknown').upper()
-        filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-        filesize_str = f"{filesize / (1024*1024):.2f} MiB" if filesize else "unknown size"
-        vcodec = fmt.get('vcodec', 'unknown')
-        fps = fmt.get('fps', 30)
+        subprocess.run([
+            'ffmpeg', '-i', file_path, '-ss', str(start_time),
+            '-t', str(part_duration), '-c', 'copy', part_file, '-y'
+        ], capture_output=True)
         
-        button_text = f"{height}p [ {ext} ] {filesize_str} [ {vcodec} {fps} ]"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"quality_{fmt['format_id']}")])
+        if os.path.exists(part_file):
+            part_files.append(part_file)
     
-    keyboard.append([InlineKeyboardButton("🔙 Go Back", callback_data="go_back")])
-    return InlineKeyboardMarkup(keyboard)
-
-def get_download_options_keyboard():
-    """Create download options keyboard after format selection"""
-    keyboard = [
-        [InlineKeyboardButton("✅ Get TG File", callback_data="download_file")],
-        [InlineKeyboardButton("✂️ trim video 🎮", callback_data="trim_video")],
-        [InlineKeyboardButton("🔙 Go Back", callback_data="select_quality")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return part_files
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
-    await message.reply_text(
-        "🎬 **YouTube Downloader Bot**\n\n"
-        "Send me a YouTube URL to get started!",
-        reply_markup=None
-    )
+    welcome_text = """
+🎬 **YouTube Downloader Bot**
+
+Send me a YouTube URL and I'll help you download it in your preferred format!
+
+Supported formats:
+• 📹 Video (MP4, WebM)
+• 🎵 Audio (MP3, M4A)
+• 📄 Document
+• ℹ️ Info only
+
+Just send me a YouTube URL to get started!
+"""
+    await message.reply_text(welcome_text)
 
 @app.on_message(filters.text & ~filters.command(["start"]))
 async def handle_url(client, message):
     url = message.text.strip()
     
     # Basic YouTube URL validation
-    if not ("youtube.com" in url or "youtu.be" in url):
+    if "youtube.com" not in url and "youtu.be" not in url:
         await message.reply_text("❌ Please send a valid YouTube URL!")
         return
     
-    status_msg = await message.reply_text("🔍 Analyzing video...")
+    progress_msg = await message.reply_text("🔍 Analyzing video...")
+    
+    video_info = get_video_info(url)
+    if not video_info:
+        await progress_msg.edit_text("❌ Failed to get video information. Please check the URL!")
+        return
+    
+    # Store video info for user
+    user_data[message.from_user.id] = {
+        'url': url,
+        'info': video_info
+    }
+    
+    # Create format selection keyboard
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 Audio", callback_data="format_audio")],
+        [InlineKeyboardButton("ℹ️ Info", callback_data="format_info")],
+        [InlineKeyboardButton("📄 Document", callback_data="format_document")],
+        [InlineKeyboardButton("🎬 Video", callback_data="format_video")]
+    ])
+    
+    await progress_msg.edit_text(
+        "**Please select required format:** 😬",
+        reply_markup=keyboard
+    )
+
+@app.on_callback_query(filters.regex("format_"))
+async def handle_format_selection(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    format_type = callback_query.data.split("_")[1]
+    
+    if user_id not in user_data:
+        await callback_query.answer("❌ Session expired. Please send the URL again.")
+        return
+    
+    video_info = user_data[user_id]['info']
+    
+    if format_type == "info":
+        # Show video information
+        duration = format_duration(video_info.get('duration', 0))
+        info_text = f"""
+📹 **Video Information**
+
+**Title:** {video_info.get('title', 'N/A')}
+**Duration:** {duration}
+**Views:** {video_info.get('view_count', 'N/A'):,}
+**Uploader:** {video_info.get('uploader', 'N/A')}
+**Upload Date:** {video_info.get('upload_date', 'N/A')}
+
+**Description:**
+{video_info.get('description', 'N/A')[:500]}...
+"""
+        await callback_query.edit_message_text(info_text)
+        return
+    
+    elif format_type == "audio":
+        # Handle audio download
+        await callback_query.edit_message_text("🎵 Preparing audio download...")
+        await download_media(callback_query, "audio")
+        return
+    
+    elif format_type == "document":
+        # Handle document download
+        await callback_query.edit_message_text("📄 Preparing document download...")
+        await download_media(callback_query, "document")
+        return
+    
+    elif format_type == "video":
+        # Show video quality options
+        formats = video_info.get('formats', [])
+        video_formats = []
+        
+        for fmt in formats:
+            if fmt.get('vcodec') != 'none' and fmt.get('height'):
+                height = fmt.get('height')
+                ext = fmt.get('ext', 'mp4').upper()
+                filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+                size_str = format_filesize(filesize) if filesize else "unknown"
+                vcodec = fmt.get('vcodec', 'unknown')
+                fps = fmt.get('fps', 30)
+                
+                quality_text = f"{height}p"
+                if fps > 30:
+                    quality_text += f"{int(fps)}"
+                
+                format_text = f"{quality_text} [ {ext} ] {size_str} [ {vcodec} {fps} ]"
+                video_formats.append((fmt['format_id'], format_text, fmt))
+        
+        # Remove duplicates and sort by quality
+        unique_formats = []
+        seen_qualities = set()
+        
+        for fmt_id, fmt_text, fmt_data in sorted(video_formats, key=lambda x: x[2].get('height', 0)):
+            quality_key = (fmt_data.get('height'), fmt_data.get('ext'))
+            if quality_key not in seen_qualities:
+                seen_qualities.add(quality_key)
+                unique_formats.append((fmt_id, fmt_text))
+        
+        # Create keyboard with video formats
+        keyboard_buttons = []
+        for fmt_id, fmt_text in unique_formats[-15:]:  # Show last 15 formats
+            keyboard_buttons.append([InlineKeyboardButton(fmt_text, callback_data=f"video_{fmt_id}")])
+        
+        keyboard_buttons.append([InlineKeyboardButton("🔙 Go Back", callback_data="go_back")])
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        
+        await callback_query.edit_message_text(
+            "**Please select your required quality / format** 🦾",
+            reply_markup=keyboard
+        )
+
+@app.on_callback_query(filters.regex("video_"))
+async def handle_video_quality_selection(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    format_id = callback_query.data.split("_", 1)[1]
+    
+    if user_id not in user_data:
+        await callback_query.answer("❌ Session expired. Please send the URL again.")
+        return
+    
+    video_info = user_data[user_id]['info']
+    
+    # Find selected format
+    selected_format = None
+    for fmt in video_info.get('formats', []):
+        if fmt['format_id'] == format_id:
+            selected_format = fmt
+            break
+    
+    if not selected_format:
+        await callback_query.answer("❌ Format not found!")
+        return
+    
+    # Show download confirmation
+    height = selected_format.get('height', 'unknown')
+    ext = selected_format.get('ext', 'mp4').upper()
+    filesize = selected_format.get('filesize') or selected_format.get('filesize_approx', 0)
+    size_str = format_filesize(filesize) if filesize else "unknown"
+    vcodec = selected_format.get('vcodec', 'unknown')
+    fps = selected_format.get('fps', 30)
+    duration = format_duration(video_info.get('duration', 0))
+    
+    quality_text = f"{height}p"
+    if fps > 30:
+        quality_text += f"{int(fps)}"
+    
+    confirmation_text = f"""
+**Selected Format:** {quality_text} [ {ext} ] {size_str} [ {vcodec} {fps} ]
+**Upload Type:** Video
+
+**YouTube Duration:** {duration}
+"""
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Get TG File", callback_data=f"download_{format_id}")],
+        [InlineKeyboardButton("🔙 Go Back", callback_data="go_back")]
+    ])
+    
+    await callback_query.edit_message_text(confirmation_text, reply_markup=keyboard)
+
+@app.on_callback_query(filters.regex("download_"))
+async def handle_download(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    format_id = callback_query.data.split("_", 1)[1]
+    
+    if user_id not in user_data:
+        await callback_query.answer("❌ Session expired. Please send the URL again.")
+        return
+    
+    await callback_query.edit_message_text("**Contacting YouTube to get 🕹 download details**")
+    await download_media(callback_query, "video", format_id)
+
+@app.on_callback_query(filters.regex("go_back"))
+async def handle_go_back(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    
+    if user_id not in user_data:
+        await callback_query.answer("❌ Session expired. Please send the URL again.")
+        return
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 Audio", callback_data="format_audio")],
+        [InlineKeyboardButton("ℹ️ Info", callback_data="format_info")],
+        [InlineKeyboardButton("📄 Document", callback_data="format_document")],
+        [InlineKeyboardButton("🎬 Video", callback_data="format_video")]
+    ])
+    
+    await callback_query.edit_message_text(
+        "**Please select required format:** 😬",
+        reply_markup=keyboard
+    )
+
+async def download_media(callback_query: CallbackQuery, media_type: str, format_id: str = None):
+    user_id = callback_query.from_user.id
+    url = user_data[user_id]['url']
+    video_info = user_data[user_id]['info']
+    
+    # Create temporary directory
+    temp_dir = tempfile.mkdtemp()
     
     try:
-        video_info = get_video_info(url)
-        if not video_info:
-            await status_msg.edit_text("❌ Failed to analyze video. Please check the URL.")
+        # Get original title for filename
+        original_title = video_info.get('title', 'video')
+        # Clean filename from invalid characters
+        safe_title = "".join(c for c in original_title if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
+        
+        # Configure yt-dlp options based on media type
+        ydl_opts = {
+            'outtmpl': f'{temp_dir}/{safe_title}.%(ext)s',
+            'quiet': True,
+        }
+        
+        if media_type == "audio":
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'outtmpl': f'{temp_dir}/{safe_title}.%(ext)s',
+            })
+        elif media_type == "video" and format_id:
+            ydl_opts['format'] = format_id
+        elif media_type == "document":
+            ydl_opts['format'] = 'best'
+        
+        # Download the file
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        # Find downloaded file
+        downloaded_files = []
+        for file in os.listdir(temp_dir):
+            file_path = os.path.join(temp_dir, file)
+            if os.path.isfile(file_path):
+                downloaded_files.append(file_path)
+        
+        if not downloaded_files:
+            await callback_query.edit_message_text("❌ Download failed!")
             return
         
-        user_sessions[message.from_user.id] = {
-            'url': url,
-            'video_info': video_info,
-            'selected_format': None,
-            'selected_quality': None
-        }
+        main_file = downloaded_files[0]
+        file_size = os.path.getsize(main_file)
+        original_filename = os.path.basename(main_file)
         
-        await status_msg.edit_text(
-            f"🎬 **{video_info.get('title', 'Unknown Title')}**\n\n"
-            f"⏱ Duration: {format_duration(video_info.get('duration', 0))}\n"
-            f"👁 Views: {video_info.get('view_count', 'Unknown'):,}\n\n"
-            "please select, required format: 😬",
-            reply_markup=get_format_keyboard()
-        )
-        
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
-
-@app.on_callback_query()
-async def handle_callback(client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    data = callback_query.data
-    
-    # Answer callback query first to prevent timeout
-    try:
-        await callback_query.answer()
-    except Exception:
-        pass  # Ignore if already answered or expired
-    
-    if user_id not in user_sessions:
-        try:
-            await callback_query.edit_message_text("❌ Session expired. Please send the URL again.")
-        except Exception:
-            await callback_query.message.reply_text("❌ Session expired. Please send the URL again.")
-        return
-    
-    session = user_sessions[user_id]
-    
-    try:
-        if data == "format_video":
-            formats = session['video_info'].get('formats', [])
-            session['selected_format'] = 'video'
+        # Check if file needs to be split (>1GB)
+        if file_size > 1024 * 1024 * 1024:  # 1GB
+            await callback_query.edit_message_text("📁 File is large, splitting into parts...")
+            split_files = await split_video(main_file)
             
-            await callback_query.edit_message_text(
-                "please select your required quality / format 🦾",
-                reply_markup=get_video_quality_keyboard(formats)
-            )
-        
-        elif data.startswith("quality_"):
-            format_id = data.split("_", 1)[1]
-            session['selected_quality'] = format_id
-            
-            # Find the selected format
-            selected_fmt = None
-            for fmt in session['video_info']['formats']:
-                if fmt['format_id'] == format_id:
-                    selected_fmt = fmt
-                    break
-            
-            if selected_fmt:
-                height = selected_fmt.get('height', 'unknown')
-                ext = selected_fmt.get('ext', 'unknown').upper()
-                filesize = selected_fmt.get('filesize') or selected_fmt.get('filesize_approx', 0)
-                filesize_str = f"{filesize / (1024*1024):.2f} MiB" if filesize else "unknown size"
-                vcodec = selected_fmt.get('vcodec', 'unknown')
-                fps = selected_fmt.get('fps', 30)
-                duration = session['video_info'].get('duration', 0)
+            for i, part_file in enumerate(split_files):
+                progress_text = f"📤 Uploading part {i+1}/{len(split_files)}..."
+                await callback_query.edit_message_text(progress_text)
                 
-                format_text = f"{height}p [ {ext} ] {filesize_str} [ {vcodec} {fps} ]"
+                # Create proper filename for parts
+                name, ext = os.path.splitext(original_filename)
+                part_filename = f"{name}_part{i+1}{ext}"
                 
-                await callback_query.edit_message_text(
-                    f"**Selected Format:** {format_text}\n"
-                    f"**Upload Type:** Video\n\n"
-                    f"**YouTube Duration:** {format_duration(duration)}\n",
-                    reply_markup=get_download_options_keyboard()
+                if media_type == "audio":
+                    await callback_query.message.reply_audio(
+                        part_file,
+                        file_name=part_filename,
+                        title=f"{safe_title} - Part {i+1}"
+                    )
+                elif media_type == "document":
+                    await callback_query.message.reply_document(
+                        part_file,
+                        file_name=part_filename
+                    )
+                else:
+                    await callback_query.message.reply_video(
+                        part_file,
+                        file_name=part_filename
+                    )
+        else:
+            await callback_query.edit_message_text("📤 Uploading file...")
+            
+            if media_type == "audio":
+                await callback_query.message.reply_audio(
+                    main_file,
+                    file_name=original_filename,
+                    title=safe_title,
+                    performer=video_info.get('uploader', 'Unknown')
                 )
-        
-        elif data == "download_file":
-            await callback_query.edit_message_text("🔄 contacting YouTube to get 🕹 download details")
-            await download_and_send(callback_query, session)
-        
-        elif data == "trim_video":
-            session['awaiting_trim_start'] = True
-            await callback_query.edit_message_text(
-                "✂️ **Video Trimming**\n\n"
-                "Please enter the **start time** in format: `HH:MM:SS`\n"
-                "Example: `00:01:30` for 1 minute 30 seconds"
-            )
-        
-        elif data == "go_back":
-            await callback_query.edit_message_text(
-                "please select, required format: 😬",
-                reply_markup=get_format_keyboard()
-            )
-        
-        elif data == "select_quality":
-            formats = session['video_info'].get('formats', [])
-            await callback_query.edit_message_text(
-                "please select your required quality / format 🦾",
-                reply_markup=get_video_quality_keyboard(formats)
-            )
-            
-    except Exception as e:
-        # If editing fails, send a new message
-        try:
-            await callback_query.message.reply_text(f"❌ Error: {str(e)}")
-        except Exception:
-            pass
-
-async def download_and_send(callback_query, session):
-    """Download and send the video file"""
-    try:
-        url = session['url']
-        format_id = session['selected_quality']
-        
-        # Create download directory
-        download_dir = "downloads"
-        os.makedirs(download_dir, exist_ok=True)
-        
-        # Download the video
-        ydl_opts = {
-            'format': format_id,
-            'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-            'quiet': True
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-        
-        if os.path.exists(filename):
-            # Send the file
-            try:
-                await callback_query.edit_message_text("📤 Uploading file...")
-            except Exception:
-                pass
-            
-            with open(filename, 'rb') as video_file:
+            elif media_type == "document":
+                await callback_query.message.reply_document(
+                    main_file,
+                    file_name=original_filename
+                )
+            else:
                 await callback_query.message.reply_video(
-                    video_file,
-                    caption=f"🎬 {info.get('title', 'Video')}\n⏱ Duration: {format_duration(info.get('duration', 0))}"
+                    main_file,
+                    file_name=original_filename
                 )
-            
-            # Clean up
-            os.remove(filename)
-            try:
-                await callback_query.edit_message_text("✅ Download completed!")
-            except Exception:
-                await callback_query.message.reply_text("✅ Download completed!")
-        else:
-            try:
-                await callback_query.edit_message_text("❌ Download failed!")
-            except Exception:
-                await callback_query.message.reply_text("❌ Download failed!")
-            
+        
+        await callback_query.edit_message_text("✅ Upload completed successfully!")
+        
     except Exception as e:
-        try:
-            await callback_query.edit_message_text(f"❌ Error: {str(e)}")
-        except Exception:
-            await callback_query.message.reply_text(f"❌ Error: {str(e)}")
-
-@app.on_message(filters.text & filters.regex(r'^\d{2}:\d{2}:\d{2}$'))
-async def handle_time_input(client, message):
-    user_id = message.from_user.id
+        await callback_query.edit_message_text(f"❌ Error during download: {str(e)}")
     
-    if user_id not in user_sessions:
-        return
-    
-    session = user_sessions[user_id]
-    
-    if session.get('awaiting_trim_start'):
-        session['trim_start'] = message.text
-        session['awaiting_trim_start'] = False
-        session['awaiting_trim_end'] = True
-        
-        await message.reply_text(
-            f"✅ Start time set: `{message.text}`\n\n"
-            "Now enter the **end time** in format: `HH:MM:SS`\n"
-            "Example: `00:03:00` for 3 minutes"
-        )
-    
-    elif session.get('awaiting_trim_end'):
-        session['trim_end'] = message.text
-        session['awaiting_trim_end'] = False
-        
-        await message.reply_text(
-            f"✂️ **Trimming Settings:**\n"
-            f"Start: `{session['trim_start']}`\n"
-            f"End: `{message.text}`\n\n"
-            "🔄 Processing trimmed video..."
-        )
-        
-        await trim_and_send_video(message, session)
-
-async def trim_and_send_video(message, session):
-    """Trim and send the video"""
-    try:
-        url = session['url']
-        format_id = session['selected_quality']
-        start_time = session['trim_start']
-        end_time = session['trim_end']
-        
-        # Create download directory
-        download_dir = "downloads"
-        os.makedirs(download_dir, exist_ok=True)
-        
-        # Download the video
-        ydl_opts = {
-            'format': format_id,
-            'outtmpl': f'{download_dir}/%(title)s.%(ext)s',
-            'quiet': True
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            input_filename = ydl.prepare_filename(info)
-        
-        # Trim the video using ffmpeg
-        output_filename = input_filename.replace('.', '_trimmed.')
-        
-        cmd = [
-            'ffmpeg', '-i', input_filename,
-            '-ss', start_time, '-to', end_time,
-            '-c', 'copy', output_filename, '-y'
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        
-        await process.communicate()
-        
-        if os.path.exists(output_filename):
-            # Send the trimmed file
-            with open(output_filename, 'rb') as video_file:
-                await message.reply_video(
-                    video_file,
-                    caption=f"✂️ Trimmed: {info.get('title', 'Video')}\n"
-                           f"⏱ From: {start_time} To: {end_time}"
-                )
-            
-            # Clean up
-            os.remove(input_filename)
-            os.remove(output_filename)
-            
-            await message.reply_text("✅ Trimmed video sent!")
-        else:
-            await message.reply_text("❌ Trimming failed!")
-            
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {str(e)}")
-
-async def main():
-    """Main function to run both web server and bot"""
-    # Start web server for health checks
-    await start_web_server()
-    
-    # Start the Telegram bot
-    print("🚀 Bot starting...")
-    await app.start()
-    
-    # Keep the application running
-    await asyncio.Event().wait()
+    finally:
+        # Clean up temporary files
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        # Clear user data
+        if user_id in user_data:
+            del user_data[user_id]
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run()

@@ -1,7 +1,7 @@
 pyrogram==2.0.106
 python-dotenv==1.0.0
 TgCrypto==1.2.5
-yt-dlp>=2023.12.30
+yt-dlp
 aiofiles==23.2.1
 uvicorn==0.24.0
 ffmpeg-python
