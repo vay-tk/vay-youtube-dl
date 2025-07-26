@@ -7,6 +7,8 @@ import yt_dlp
 from dotenv import load_dotenv
 import subprocess
 import json
+from aiohttp import web
+import threading
 
 load_dotenv()
 
@@ -18,6 +20,23 @@ app = Client("youtube_dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_T
 
 # Storage for user sessions
 user_sessions = {}
+
+# Health check web server
+async def health_check(request):
+    return web.Response(text="OK", status=200)
+
+async def start_web_server():
+    """Start a simple web server for health checks"""
+    web_app = web.Application()
+    web_app.router.add_get('/health', health_check)
+    web_app.router.add_get('/', health_check)
+    
+    port = int(os.environ.get('PORT', 8000))
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Web server started on port {port}")
 
 def get_video_info(url):
     """Extract video information using yt-dlp"""
@@ -374,6 +393,17 @@ async def trim_and_send_video(message, session):
     except Exception as e:
         await message.reply_text(f"❌ Error: {str(e)}")
 
-if __name__ == "__main__":
+async def main():
+    """Main function to run both web server and bot"""
+    # Start web server for health checks
+    await start_web_server()
+    
+    # Start the Telegram bot
     print("🚀 Bot starting...")
-    app.run()
+    await app.start()
+    
+    # Keep the application running
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
