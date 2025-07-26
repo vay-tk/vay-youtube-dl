@@ -6,5 +6,5 @@ aiofiles==23.2.1
 uvicorn==0.24.0
 ffmpeg-python
 aiohttp
-browser-cookie3
-pycryptodome
+requests
+fake-useragent

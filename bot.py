@@ -3,6 +3,7 @@ import asyncio
 import math
 import random
 import time
+import re
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 import yt_dlp
@@ -10,6 +11,8 @@ from dotenv import load_dotenv
 import tempfile
 import shutil
 import json
+import requests
+from fake_useragent import UserAgent
 
 load_dotenv()
 
@@ -23,6 +26,12 @@ app = Client(
 # Store user selections temporarily
 user_data = {}
 
+# Initialize user agent generator
+try:
+    ua = UserAgent()
+except:
+    ua = None
+
 # Professional user agents for rotation
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -32,6 +41,37 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0'
 ]
+
+def get_random_user_agent():
+    """Get a random user agent"""
+    if ua:
+        try:
+            return ua.random
+        except:
+            pass
+    return random.choice(USER_AGENTS)
+
+def validate_youtube_url(url):
+    """Validate and clean YouTube URL"""
+    # Remove extra whitespace and common prefixes
+    url = url.strip()
+    
+    # YouTube URL patterns
+    youtube_patterns = [
+        r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
+        r'(?:https?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+        r'(?:https?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]{11})',
+        r'(?:https?://)?youtu\.be/([a-zA-Z0-9_-]{11})',
+        r'(?:https?://)?(?:www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]{11})',
+    ]
+    
+    for pattern in youtube_patterns:
+        match = re.search(pattern, url)
+        if match:
+            video_id = match.group(1)
+            return f"https://www.youtube.com/watch?v={video_id}", True
+    
+    return url, False
 
 def get_cookies_path():
     """Get path to cookies file"""
@@ -44,7 +84,7 @@ def create_robust_ydl_opts(additional_opts=None):
     base_opts = {
         'quiet': True,
         'no_warnings': True,
-        'user_agent': random.choice(USER_AGENTS),
+        'user_agent': get_random_user_agent(),
         'sleep_interval': random.uniform(1, 3),
         'max_sleep_interval': 5,
         'extractor_retries': 3,
@@ -62,18 +102,10 @@ def create_robust_ydl_opts(additional_opts=None):
         }
     }
     
-    # Add cookies if available
+    # Add cookies if available (but don't try browser extraction to avoid errors)
     cookies_path = get_cookies_path()
-    if os.path.exists(cookies_path):
+    if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
         base_opts['cookiefile'] = cookies_path
-    
-    # Try to extract cookies from browser as fallback
-    for browser in ['chrome', 'firefox', 'safari', 'edge']:
-        try:
-            base_opts['cookiesfrombrowser'] = (browser,)
-            break
-        except:
-            continue
     
     if additional_opts:
         base_opts.update(additional_opts)
@@ -133,11 +165,11 @@ def get_video_info_with_fallback(url, retry_count=0):
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             }
         },
-        # Strategy 3: Embed extraction
+        # Strategy 3: Basic extraction with minimal options
         {
-            'user_agent': random.choice(USER_AGENTS),
+            'user_agent': get_random_user_agent(),
             'extract_flat': False,
-            'force_json': True,
+            'no_check_certificate': True,
         }
     ]
     
@@ -232,17 +264,31 @@ Supported formats:
 • 📄 Document
 • ℹ️ Info only
 
+**Supported URL formats:**
+• `https://www.youtube.com/watch?v=VIDEO_ID`
+• `https://youtu.be/VIDEO_ID`
+• `https://www.youtube.com/shorts/VIDEO_ID`
+
 Just send me a YouTube URL to get started!
 """
     await message.reply_text(welcome_text)
 
 @app.on_message(filters.text & ~filters.command(["start"]))
 async def handle_url(client, message):
-    url = message.text.strip()
+    original_url = message.text.strip()
     
-    # Basic YouTube URL validation
-    if "youtube.com" not in url and "youtu.be" not in url:
-        await message.reply_text("❌ Please send a valid YouTube URL!")
+    # Validate and clean YouTube URL
+    cleaned_url, is_valid = validate_youtube_url(original_url)
+    
+    if not is_valid:
+        await message.reply_text(
+            "❌ **Invalid YouTube URL!**\n\n"
+            "Please send a valid YouTube URL in one of these formats:\n"
+            "• `https://www.youtube.com/watch?v=VIDEO_ID`\n"
+            "• `https://youtu.be/VIDEO_ID`\n"
+            "• `https://www.youtube.com/shorts/VIDEO_ID`\n\n"
+            "**Example:** `https://www.youtube.com/watch?v=dQw4w9WgXcQ`"
+        )
         return
     
     progress_msg = await message.reply_text("🔍 Analyzing video...")
@@ -253,7 +299,7 @@ async def handle_url(client, message):
         if attempt > 0:
             await progress_msg.edit_text(f"🔍 Analyzing video... (Attempt {attempt + 1}/3)")
         
-        video_info = get_video_info(url, attempt)
+        video_info = get_video_info(cleaned_url, attempt)
         if video_info:
             break
         
@@ -264,24 +310,26 @@ async def handle_url(client, message):
         error_text = """
 ❌ **Failed to get video information**
 
-This might be due to:
-• Video is private or restricted
-• YouTube bot detection
+**Possible reasons:**
+• Video is private, deleted, or restricted
+• YouTube bot detection (temporary)
 • Video is not available in your region
+• Age-restricted content
 
 **Solutions:**
-1. Try again in a few minutes
-2. Make sure the video is public
-3. Contact admin if issue persists
+1. ✅ **Try again in 2-3 minutes**
+2. 🔓 Make sure the video is public
+3. 🌍 Check if video is available in your region
+4. 🍪 Contact admin for cookie setup (bypasses most restrictions)
 
-💡 **Tip:** The bot automatically tries multiple methods to bypass restrictions.
+💡 **Tip:** The bot uses multiple bypass methods automatically.
 """
         await progress_msg.edit_text(error_text)
         return
     
     # Store video info for user
     user_data[message.from_user.id] = {
-        'url': url,
+        'url': cleaned_url,
         'info': video_info
     }
     
@@ -293,8 +341,9 @@ This might be due to:
         [InlineKeyboardButton("🎬 Video", callback_data="format_video")]
     ])
     
+    title = video_info.get('title', 'Unknown Title')[:50]
     await progress_msg.edit_text(
-        "**Please select required format:** 😬",
+        f"✅ **Video Found:** {title}...\n\n**Please select required format:** 😬",
         reply_markup=keyboard
     )
 
@@ -507,7 +556,7 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
                 if attempt > 0:
                     await callback_query.edit_message_text(f"📥 Download attempt {attempt + 1}/{max_download_retries}...")
                     # Rotate user agent for retry
-                    ydl_opts['user_agent'] = random.choice(USER_AGENTS)
+                    ydl_opts['user_agent'] = get_random_user_agent()
                     time.sleep(random.uniform(3, 6))
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -596,8 +645,12 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         if 'sign in to confirm' in error_msg.lower() or 'bot' in error_msg.lower():
             await callback_query.edit_message_text(
                 "❌ **YouTube Bot Detection**\n\n"
-                "YouTube has detected automated access. This is temporary.\n"
-                "Please try again in a few minutes or contact admin for cookies setup."
+                "YouTube has detected automated access. This is temporary.\n\n"
+                "**Solutions:**\n"
+                "• Wait 5-10 minutes and try again\n"
+                "• Contact admin for cookie setup\n"
+                "• Try a different video\n\n"
+                "🍪 **Note:** Cookie setup bypasses most restrictions."
             )
         else:
             await callback_query.edit_message_text(f"❌ Error during download: {str(e)}")
