@@ -87,22 +87,28 @@ def create_robust_ydl_opts(additional_opts=None):
         'user_agent': get_random_user_agent(),
         'sleep_interval': random.uniform(1, 3),
         'max_sleep_interval': 5,
-        'extractor_retries': 3,
-        'fragment_retries': 3,
+        'extractor_retries': 5,
+        'fragment_retries': 5,
         'skip_unavailable_fragments': True,
         'ignoreerrors': False,
         'no_check_certificate': True,
         'prefer_insecure': False,
+        # Anti-403 measures
+        'referer': 'https://www.youtube.com/',
         'http_headers': {
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
         }
     }
     
-    # Add cookies if available (but don't try browser extraction to avoid errors)
+    # Add cookies if available
     cookies_path = get_cookies_path()
     if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
         base_opts['cookiefile'] = cookies_path
@@ -145,31 +151,39 @@ def get_video_info(url, retry_count=0):
         return None
 
 def get_video_info_with_fallback(url, retry_count=0):
-    """Fallback method with different strategies"""
+    """Fallback method with different strategies for 403 errors"""
     strategies = [
-        # Strategy 1: Use different user agent and headers
+        # Strategy 1: Standard approach with proper headers
         {
-            'user_agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'referer': 'https://www.youtube.com/',
             'http_headers': {
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'DNT': '1',
                 'Connection': 'keep-alive',
+                'Origin': 'https://www.youtube.com',
             }
         },
-        # Strategy 2: Mobile user agent
+        # Strategy 2: Mobile user agent to avoid 403
         {
             'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
             'http_headers': {
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'X-Forwarded-For': f'{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}',
             }
         },
-        # Strategy 3: Basic extraction with minimal options
+        # Strategy 3: Embed extraction as last resort
         {
             'user_agent': get_random_user_agent(),
             'extract_flat': False,
-            'no_check_certificate': True,
+            'format': 'best[height<=720]/best',  # Fallback format
+            'http_headers': {
+                'Referer': 'https://www.youtube.com/',
+                'X-YouTube-Client-Name': '1',
+                'X-YouTube-Client-Version': '2.20231201.01.00',
+            }
         }
     ]
     
@@ -178,7 +192,7 @@ def get_video_info_with_fallback(url, retry_count=0):
             continue
             
         try:
-            time.sleep(random.uniform(3, 6))  # Longer delay
+            time.sleep(random.uniform(3, 8))  # Longer delay for 403 issues
             ydl_opts = create_robust_ydl_opts(strategy)
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -186,7 +200,24 @@ def get_video_info_with_fallback(url, retry_count=0):
                 return info
                 
         except Exception as e:
-            continue
+            error_msg = str(e).lower()
+            if '403' in error_msg or 'forbidden' in error_msg:
+                # Try next strategy for 403 errors
+                continue
+            elif 'format' in error_msg:
+                # Try with basic format selection
+                try:
+                    basic_opts = create_robust_ydl_opts({
+                        'format': 'best/worst',
+                        'user_agent': strategy.get('user_agent', get_random_user_agent())
+                    })
+                    with yt_dlp.YoutubeDL(basic_opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                        return info
+                except:
+                    continue
+            else:
+                continue
     
     return None
 
@@ -389,27 +420,46 @@ async def handle_format_selection(client, callback_query: CallbackQuery):
         return
     
     elif format_type == "video":
-        # Show video quality options
+        # Show video quality options with better error handling
         formats = video_info.get('formats', [])
         video_formats = []
         
+        # Filter and validate formats
         for fmt in formats:
-            if fmt.get('vcodec') != 'none' and fmt.get('height'):
-                height = fmt.get('height')
-                ext = fmt.get('ext', 'mp4').upper()
-                filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-                size_str = format_filesize(filesize) if filesize else "unknown"
-                vcodec = fmt.get('vcodec', 'unknown')
-                fps = fmt.get('fps', 30)
-                
-                quality_text = f"{height}p"
-                if fps > 30:
-                    quality_text += f"{int(fps)}"
-                
-                format_text = f"{quality_text} [ {ext} ] {size_str} [ {vcodec} {fps} ]"
-                video_formats.append((fmt['format_id'], format_text, fmt))
+            try:
+                if fmt.get('vcodec') != 'none' and fmt.get('height') and fmt.get('url'):
+                    height = fmt.get('height')
+                    ext = fmt.get('ext', 'mp4').upper()
+                    filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+                    size_str = format_filesize(filesize) if filesize else "~unknown"
+                    vcodec = fmt.get('vcodec', 'unknown')[:12]  # Truncate long codec names
+                    fps = fmt.get('fps', 30)
+                    
+                    # Skip problematic formats
+                    if 'storyboard' in str(fmt.get('format_note', '')).lower():
+                        continue
+                    
+                    quality_text = f"{height}p"
+                    if fps > 30:
+                        quality_text += f"{int(fps)}"
+                    
+                    format_text = f"{quality_text} [ {ext} ] {size_str} [ {vcodec} {fps} ]"
+                    video_formats.append((fmt['format_id'], format_text, fmt))
+            except Exception:
+                continue  # Skip problematic formats
         
-        # Remove duplicates and sort by quality
+        if not video_formats:
+            await callback_query.edit_message_text(
+                "❌ **No video formats available**\n\n"
+                "This might be due to:\n"
+                "• Regional restrictions\n"
+                "• Age restrictions\n"
+                "• YouTube blocking access\n\n"
+                "Try selecting **Audio** or **Document** format instead."
+            )
+            return
+        
+        # Sort by quality and remove duplicates
         unique_formats = []
         seen_qualities = set()
         
@@ -419,9 +469,9 @@ async def handle_format_selection(client, callback_query: CallbackQuery):
                 seen_qualities.add(quality_key)
                 unique_formats.append((fmt_id, fmt_text))
         
-        # Create keyboard with video formats
+        # Create keyboard with video formats (show best options first)
         keyboard_buttons = []
-        for fmt_id, fmt_text in unique_formats[-15:]:  # Show last 15 formats
+        for fmt_id, fmt_text in unique_formats[-15:]:  # Show last 15 formats (highest quality)
             keyboard_buttons.append([InlineKeyboardButton(fmt_text, callback_data=f"video_{fmt_id}")])
         
         keyboard_buttons.append([InlineKeyboardButton("🔙 Go Back", callback_data="go_back")])
@@ -524,12 +574,13 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
     try:
         # Get original title for filename
         original_title = video_info.get('title', 'video')
-        # Clean filename from invalid characters
         safe_title = "".join(c for c in original_title if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
         
-        # Configure yt-dlp options with anti-bot measures
+        # Configure yt-dlp options with enhanced anti-403 measures
         ydl_opts = create_robust_ydl_opts({
             'outtmpl': f'{temp_dir}/{safe_title}.%(ext)s',
+            'retries': 10,
+            'file_access_retries': 10,
         })
         
         if media_type == "audio":
@@ -540,24 +591,35 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
-                'outtmpl': f'{temp_dir}/{safe_title}.%(ext)s',
             })
         elif media_type == "video" and format_id:
-            ydl_opts['format'] = format_id
+            # Validate format exists and add fallbacks
+            available_formats = [f['format_id'] for f in video_info.get('formats', [])]
+            if format_id in available_formats:
+                ydl_opts['format'] = f'{format_id}/best[height<=720]/best/worst'
+            else:
+                ydl_opts['format'] = 'best[height<=720]/best/worst'
         elif media_type == "document":
-            ydl_opts['format'] = 'best'
+            ydl_opts['format'] = 'best/worst'
         
-        # Download with retry mechanism
-        max_download_retries = 2
+        # Download with enhanced retry mechanism
+        max_download_retries = 3
         download_success = False
+        last_error = None
         
         for attempt in range(max_download_retries):
             try:
                 if attempt > 0:
-                    await callback_query.edit_message_text(f"📥 Download attempt {attempt + 1}/{max_download_retries}...")
-                    # Rotate user agent for retry
+                    await callback_query.edit_message_text(
+                        f"📥 Download attempt {attempt + 1}/{max_download_retries}...\n"
+                        f"🔄 Using different approach to avoid 403 errors"
+                    )
+                    # Enhanced retry strategy
                     ydl_opts['user_agent'] = get_random_user_agent()
-                    time.sleep(random.uniform(3, 6))
+                    ydl_opts['sleep_interval'] = random.uniform(5, 10)
+                    # Add IP rotation simulation
+                    ydl_opts['http_headers']['X-Forwarded-For'] = f'{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}'
+                    time.sleep(random.uniform(5, 10))
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
@@ -565,12 +627,47 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
                     break
                     
             except Exception as e:
+                last_error = e
+                error_msg = str(e).lower()
+                
+                if '403' in error_msg or 'forbidden' in error_msg:
+                    # Specific handling for 403 errors
+                    if attempt < max_download_retries - 1:
+                        await callback_query.edit_message_text(
+                            f"⚠️ Access denied (403). Trying alternative method...\n"
+                            f"Attempt {attempt + 1}/{max_download_retries}"
+                        )
+                        continue
+                elif 'format' in error_msg and 'not available' in error_msg:
+                    # Handle format not available
+                    if attempt < max_download_retries - 1:
+                        ydl_opts['format'] = 'best/worst'  # Fallback to any available format
+                        continue
+                
                 if attempt == max_download_retries - 1:
                     raise e
-                continue
         
         if not download_success:
-            await callback_query.edit_message_text("❌ Download failed after multiple attempts!")
+            error_text = "❌ **Download failed after multiple attempts**\n\n"
+            if last_error:
+                error_msg = str(last_error).lower()
+                if '403' in error_msg:
+                    error_text += "**Reason:** YouTube blocked access (403 Forbidden)\n\n"
+                    error_text += "**Solutions:**\n"
+                    error_text += "• 🍪 Ask admin to setup cookies\n"
+                    error_text += "• ⏰ Try again in 10-15 minutes\n"
+                    error_text += "• 🎵 Try Audio format instead\n"
+                    error_text += "• 🌐 Video might be region-blocked"
+                elif 'format' in error_msg:
+                    error_text += "**Reason:** Requested format not available\n\n"
+                    error_text += "**Solutions:**\n"
+                    error_text += "• 📄 Try Document format\n"
+                    error_text += "• 🎵 Try Audio format\n"
+                    error_text += "• 📹 Select a different video quality"
+                else:
+                    error_text += f"**Error:** {str(last_error)[:200]}..."
+            
+            await callback_query.edit_message_text(error_text)
             return
         
         # Find downloaded file
@@ -642,18 +739,22 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         
     except Exception as e:
         error_msg = str(e)
-        if 'sign in to confirm' in error_msg.lower() or 'bot' in error_msg.lower():
+        if '403' in error_msg.lower() or 'forbidden' in error_msg.lower():
             await callback_query.edit_message_text(
-                "❌ **YouTube Bot Detection**\n\n"
-                "YouTube has detected automated access. This is temporary.\n\n"
+                "❌ **YouTube Access Blocked (403 Forbidden)**\n\n"
+                "**This happens when:**\n"
+                "• YouTube detects automated access\n"
+                "• IP address is temporarily blocked\n"
+                "• Video has restrictions\n\n"
                 "**Solutions:**\n"
-                "• Wait 5-10 minutes and try again\n"
-                "• Contact admin for cookie setup\n"
-                "• Try a different video\n\n"
-                "🍪 **Note:** Cookie setup bypasses most restrictions."
+                "🍪 **Best:** Ask admin to setup browser cookies\n"
+                "⏰ **Wait:** Try again in 15-30 minutes\n"
+                "🎵 **Alternative:** Try Audio download\n"
+                "🌐 **VPN:** Video might be region-blocked\n\n"
+                "💡 Cookies bypass most YouTube restrictions!"
             )
         else:
-            await callback_query.edit_message_text(f"❌ Error during download: {str(e)}")
+            await callback_query.edit_message_text(f"❌ Error during download: {str(e)[:300]}...")
     
     finally:
         # Clean up temporary files
