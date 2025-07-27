@@ -1,10 +1,10 @@
 pyrogram==2.0.106
-python-dotenv==1.0.0
 TgCrypto==1.2.5
-yt-dlp
+yt-dlp==2024.04.09
 aiofiles==23.2.1
 uvicorn==0.24.0
-ffmpeg-python
-aiohttp
-requests
-fake-useragent
+ffmpeg-python==0.2.0
+aiohttp==3.8.6
+requests==2.31.0
+fake-useragent==1.5.1
+python-dotenv==1.0.0
