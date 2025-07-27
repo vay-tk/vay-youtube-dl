@@ -93,8 +93,17 @@ def create_robust_ydl_opts(additional_opts=None):
         'ignoreerrors': False,
         'no_check_certificate': True,
         'prefer_insecure': False,
-        # Anti-403 measures
+        # Enhanced anti-detection measures
         'referer': 'https://www.youtube.com/',
+        'origin': 'https://www.youtube.com',
+        # YouTube-specific client options
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'player_skip': ['webpage'],
+                'skip': ['dash', 'hls']
+            }
+        },
         'http_headers': {
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -105,6 +114,8 @@ def create_robust_ydl_opts(additional_opts=None):
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-Site': 'none',
             'Cache-Control': 'max-age=0',
+            'X-YouTube-Client-Name': '1',
+            'X-YouTube-Client-Version': '2.20240101.01.00',
         }
     }
     
@@ -118,71 +129,72 @@ def create_robust_ydl_opts(additional_opts=None):
     
     return base_opts
 
-def get_video_info(url, retry_count=0):
-    """Extract video information with robust error handling"""
-    max_retries = 3
-    
-    if retry_count >= max_retries:
-        return None
-    
-    try:
-        # Add random delay between retries
-        if retry_count > 0:
-            time.sleep(random.uniform(2, 5))
-        
-        ydl_opts = create_robust_ydl_opts()
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info
-            
-    except yt_dlp.utils.ExtractorError as e:
-        error_msg = str(e).lower()
-        
-        if 'sign in to confirm' in error_msg or 'bot' in error_msg:
-            # Handle bot detection specifically
-            if retry_count < max_retries - 1:
-                return get_video_info_with_fallback(url, retry_count + 1)
-        
-        return None
-    except Exception as e:
-        if retry_count < max_retries - 1:
-            return get_video_info(url, retry_count + 1)
-        return None
-
 def get_video_info_with_fallback(url, retry_count=0):
-    """Fallback method with different strategies for 403 errors"""
+    """Fallback method with different strategies for player response errors"""
     strategies = [
-        # Strategy 1: Standard approach with proper headers
+        # Strategy 1: Android client (most reliable)
+        {
+            'user_agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; SM-G998B) gzip',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                    'skip': ['webpage']
+                }
+            },
+            'http_headers': {
+                'X-YouTube-Client-Name': '3',
+                'X-YouTube-Client-Version': '17.36.4',
+                'X-YouTube-Identity-Token': '',
+                'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; SM-G998B) gzip'
+            }
+        },
+        # Strategy 2: iOS client
+        {
+            'user_agent': 'com.google.ios.youtube/17.36.4 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios'],
+                    'skip': ['webpage']
+                }
+            },
+            'http_headers': {
+                'X-YouTube-Client-Name': '5',
+                'X-YouTube-Client-Version': '17.36.4',
+                'User-Agent': 'com.google.ios.youtube/17.36.4 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)'
+            }
+        },
+        # Strategy 3: Web client with embed
         {
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'referer': 'https://www.youtube.com/',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web'],
+                    'player_skip': ['js'],
+                    'skip': ['dash']
+                }
+            },
             'http_headers': {
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'DNT': '1',
                 'Connection': 'keep-alive',
                 'Origin': 'https://www.youtube.com',
+                'Referer': f'https://www.youtube.com/embed/{url.split("v=")[-1].split("&")[0] if "v=" in url else url.split("/")[-1]}'
             }
         },
-        # Strategy 2: Mobile user agent to avoid 403
+        # Strategy 4: TV client (last resort)
         {
-            'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+            'user_agent': 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/40.13031.0',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['tv_embedded'],
+                    'skip': ['webpage', 'dash', 'hls']
+                }
+            },
             'http_headers': {
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'X-Forwarded-For': f'{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}',
-            }
-        },
-        # Strategy 3: Embed extraction as last resort
-        {
-            'user_agent': get_random_user_agent(),
-            'extract_flat': False,
-            'format': 'best[height<=720]/best',  # Fallback format
-            'http_headers': {
-                'Referer': 'https://www.youtube.com/',
-                'X-YouTube-Client-Name': '1',
-                'X-YouTube-Client-Version': '2.20231201.01.00',
+                'X-YouTube-Client-Name': '85',
+                'X-YouTube-Client-Version': '4.0',
+                'User-Agent': 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/40.13031.0'
             }
         }
     ]
@@ -192,7 +204,8 @@ def get_video_info_with_fallback(url, retry_count=0):
             continue
             
         try:
-            time.sleep(random.uniform(3, 8))  # Longer delay for 403 issues
+            # Longer delay for player response issues
+            time.sleep(random.uniform(5, 10))
             ydl_opts = create_robust_ydl_opts(strategy)
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -201,7 +214,14 @@ def get_video_info_with_fallback(url, retry_count=0):
                 
         except Exception as e:
             error_msg = str(e).lower()
-            if '403' in error_msg or 'forbidden' in error_msg:
+            
+            # Log the specific error for debugging
+            print(f"Strategy {i+1} failed: {error_msg[:100]}...")
+            
+            if 'player response' in error_msg:
+                # Try next strategy for player response errors
+                continue
+            elif '403' in error_msg or 'forbidden' in error_msg:
                 # Try next strategy for 403 errors
                 continue
             elif 'format' in error_msg:
@@ -209,7 +229,8 @@ def get_video_info_with_fallback(url, retry_count=0):
                 try:
                     basic_opts = create_robust_ydl_opts({
                         'format': 'best/worst',
-                        'user_agent': strategy.get('user_agent', get_random_user_agent())
+                        'user_agent': strategy.get('user_agent', get_random_user_agent()),
+                        'extractor_args': strategy.get('extractor_args', {})
                     })
                     with yt_dlp.YoutubeDL(basic_opts) as ydl:
                         info = ydl.extract_info(url, download=False)
@@ -220,6 +241,41 @@ def get_video_info_with_fallback(url, retry_count=0):
                 continue
     
     return None
+
+def get_video_info(url, retry_count=0):
+    """Extract video information with robust error handling"""
+    max_retries = 4  # Increased retries
+    
+    if retry_count >= max_retries:
+        return None
+    
+    try:
+        # Add random delay between retries
+        if retry_count > 0:
+            time.sleep(random.uniform(3, 8))
+        
+        ydl_opts = create_robust_ydl_opts()
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info
+            
+    except yt_dlp.utils.ExtractorError as e:
+        error_msg = str(e).lower()
+        
+        if any(phrase in error_msg for phrase in ['player response', 'sign in to confirm', 'bot']):
+            # Handle player response and bot detection specifically
+            if retry_count < max_retries - 1:
+                return get_video_info_with_fallback(url, retry_count + 1)
+        
+        return None
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'player response' in error_msg and retry_count < max_retries - 1:
+            return get_video_info_with_fallback(url, retry_count + 1)
+        elif retry_count < max_retries - 1:
+            return get_video_info(url, retry_count + 1)
+        return None
 
 def format_duration(seconds):
     """Format duration in human readable format"""
@@ -324,36 +380,44 @@ async def handle_url(client, message):
     
     progress_msg = await message.reply_text("🔍 Analyzing video...")
     
-    # Try multiple times with different strategies
+    # Try multiple times with different strategies (increased attempts)
     video_info = None
-    for attempt in range(3):
+    for attempt in range(4):  # Increased from 3 to 4
         if attempt > 0:
-            await progress_msg.edit_text(f"🔍 Analyzing video... (Attempt {attempt + 1}/3)")
+            status_msgs = [
+                "🔍 Analyzing video... (Using Android client)",
+                "🔍 Analyzing video... (Using iOS client)", 
+                "🔍 Analyzing video... (Using web embed)",
+                "🔍 Analyzing video... (Final attempt)"
+            ]
+            await progress_msg.edit_text(f"{status_msgs[min(attempt, 3)]}")
         
         video_info = get_video_info(cleaned_url, attempt)
         if video_info:
             break
         
-        # Wait before next attempt
-        await asyncio.sleep(2)
+        # Longer wait before next attempt for player response issues
+        await asyncio.sleep(3)
     
     if not video_info:
         error_text = """
-❌ **Failed to get video information**
+❌ **Failed to extract video information**
 
-**Possible reasons:**
-• Video is private, deleted, or restricted
-• YouTube bot detection (temporary)
-• Video is not available in your region
-• Age-restricted content
+**Most likely causes:**
+• 🔒 **YouTube API changes** (player response extraction failed)
+• 🤖 **Enhanced bot detection** (IP/user-agent blocked)
+• 🌍 **Regional restrictions** (video not available in your area)
+• 🔞 **Age restrictions** (requires sign-in)
+• 🚫 **Video is private/deleted**
 
-**Solutions:**
-1. ✅ **Try again in 2-3 minutes**
-2. 🔓 Make sure the video is public
-3. 🌍 Check if video is available in your region
-4. 🍪 Contact admin for cookie setup (bypasses most restrictions)
+**Professional Solutions:**
+1. 🍪 **Setup cookies** (most effective - contact admin)
+2. 🔄 **Try again in 15-30 minutes** (temporary blocks)
+3. 🌐 **Use VPN** (if regionally blocked)
+4. 📱 **Try different video** (test if bot-wide issue)
+5. ⚡ **Update yt-dlp** (admin should run: `pip install -U yt-dlp`)
 
-💡 **Tip:** The bot uses multiple bypass methods automatically.
+💡 **Technical Note:** YouTube frequently updates their anti-bot systems. Cookies from a logged-in browser session are the most reliable bypass method.
 """
         await progress_msg.edit_text(error_text)
         return
@@ -576,11 +640,18 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         original_title = video_info.get('title', 'video')
         safe_title = "".join(c for c in original_title if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
         
-        # Configure yt-dlp options with enhanced anti-403 measures
+        # Configure yt-dlp options with enhanced anti-detection
         ydl_opts = create_robust_ydl_opts({
             'outtmpl': f'{temp_dir}/{safe_title}.%(ext)s',
-            'retries': 10,
-            'file_access_retries': 10,
+            'retries': 15,  # Increased retries
+            'file_access_retries': 15,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                    'player_skip': ['js'],
+                    'skip': ['dash'] if media_type == 'audio' else []
+                }
+            }
         })
         
         if media_type == "audio":
@@ -593,7 +664,7 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
                 }],
             })
         elif media_type == "video" and format_id:
-            # Validate format exists and add fallbacks
+            # Enhanced format validation with fallbacks
             available_formats = [f['format_id'] for f in video_info.get('formats', [])]
             if format_id in available_formats:
                 ydl_opts['format'] = f'{format_id}/best[height<=720]/best/worst'
@@ -602,24 +673,31 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         elif media_type == "document":
             ydl_opts['format'] = 'best/worst'
         
-        # Download with enhanced retry mechanism
-        max_download_retries = 3
+        # Enhanced download with multiple client fallbacks
+        max_download_retries = 4  # Increased from 3
         download_success = False
         last_error = None
+        
+        client_strategies = ['android', 'ios', 'web', 'tv_embedded']
         
         for attempt in range(max_download_retries):
             try:
                 if attempt > 0:
+                    client_type = client_strategies[min(attempt, len(client_strategies)-1)]
                     await callback_query.edit_message_text(
                         f"📥 Download attempt {attempt + 1}/{max_download_retries}...\n"
-                        f"🔄 Using different approach to avoid 403 errors"
+                        f"🔄 Using {client_type} client to bypass restrictions"
                     )
-                    # Enhanced retry strategy
+                    
+                    # Update client strategy
+                    ydl_opts['extractor_args']['youtube']['player_client'] = [client_type]
                     ydl_opts['user_agent'] = get_random_user_agent()
-                    ydl_opts['sleep_interval'] = random.uniform(5, 10)
-                    # Add IP rotation simulation
+                    ydl_opts['sleep_interval'] = random.uniform(8, 15)
+                    
+                    # Simulate different IP
                     ydl_opts['http_headers']['X-Forwarded-For'] = f'{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}'
-                    time.sleep(random.uniform(5, 10))
+                    
+                    time.sleep(random.uniform(8, 15))
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
@@ -630,7 +708,15 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
                 last_error = e
                 error_msg = str(e).lower()
                 
-                if '403' in error_msg or 'forbidden' in error_msg:
+                if 'player response' in error_msg:
+                    # Specific handling for player response errors
+                    if attempt < max_download_retries - 1:
+                        await callback_query.edit_message_text(
+                            f"⚠️ Player response error. Switching to {client_strategies[min(attempt+1, len(client_strategies)-1)]} client...\n"
+                            f"Attempt {attempt + 1}/{max_download_retries}"
+                        )
+                        continue
+                elif '403' in error_msg or 'forbidden' in error_msg:
                     # Specific handling for 403 errors
                     if attempt < max_download_retries - 1:
                         await callback_query.edit_message_text(
@@ -651,7 +737,16 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
             error_text = "❌ **Download failed after multiple attempts**\n\n"
             if last_error:
                 error_msg = str(last_error).lower()
-                if '403' in error_msg:
+                if 'player response' in error_msg:
+                    error_text += "**Reason:** YouTube player response extraction failed\n\n"
+                    error_text += "**Solutions:**\n"
+                    error_text += "• 🍪 **Critical:** Ask admin to setup fresh cookies\n"
+                    error_text += "• ⚡ **Update:** Admin should update yt-dlp (`pip install -U yt-dlp`)\n"
+                    error_text += "• ⏰ **Wait:** Try again in 30-60 minutes\n"
+                    error_text += "• 🎵 **Alternative:** Try Audio format (often works better)\n"
+                    error_text += "• 🌐 **VPN:** Use different IP address\n\n"
+                    error_text += "💡 **Note:** This error indicates YouTube has updated their anti-bot systems."
+                elif '403' in error_msg:
                     error_text += "**Reason:** YouTube blocked access (403 Forbidden)\n\n"
                     error_text += "**Solutions:**\n"
                     error_text += "• 🍪 Ask admin to setup cookies\n"
@@ -739,7 +834,18 @@ async def download_media(callback_query: CallbackQuery, media_type: str, format_
         
     except Exception as e:
         error_msg = str(e)
-        if '403' in error_msg.lower() or 'forbidden' in error_msg.lower():
+        if 'player response' in error_msg.lower():
+            await callback_query.edit_message_text(
+                "❌ **YouTube Player Response Error**\n\n"
+                "**Critical Issue:** YouTube has updated their anti-bot systems.\n\n"
+                "**Immediate Solutions:**\n"
+                "🍪 **Most Important:** Contact admin to setup fresh browser cookies\n"
+                "⚡ **Update Required:** Admin needs to update yt-dlp library\n"
+                "⏰ **Temporary Fix:** Wait 1-2 hours and try again\n"
+                "🎵 **Alternative:** Try Audio download (may still work)\n\n"
+                "💡 **Technical:** This error means YouTube changed their player API. Fresh cookies from a real browser session usually fix this."
+            )
+        elif '403' in error_msg.lower() or 'forbidden' in error_msg.lower():
             await callback_query.edit_message_text(
                 "❌ **YouTube Access Blocked (403 Forbidden)**\n\n"
                 "**This happens when:**\n"
